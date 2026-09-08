@@ -60,7 +60,10 @@ class SessionRuntime {
   }
 
   async start() {
-    if (this.status === 'open' && this.sock) return this.snapshot();
+    // A live socket is already handling this session. This is especially
+    // important while waiting for QR: connectPromise only covers socket
+    // creation, not the full QR pairing lifecycle.
+    if (this.sock && ['connecting', 'qr', 'open'].includes(this.status)) return this.snapshot();
     if (this.connectPromise) {
       await this.connectPromise;
       return this.snapshot();
