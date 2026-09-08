@@ -4,7 +4,6 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   isJidBroadcast,
   isJidNewsletter,
-  getContentType,
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -14,10 +13,11 @@ import { createDbAuthState } from '../auth.js';
 import { logger } from '../logger.js';
 import { env } from '../config.js';
 import {
-  getSession, getMessage, upsertContacts, upsertChats, upsertMessages,
+  getMessage, upsertContacts, upsertChats, upsertMessages,
   upsertGroups, persistHistory, upsertSession
 } from './repository.js';
 import { persistIncomingMedia } from './media.js';
+import { supabase } from '../supabase.js';
 
 class TTLCache {
   constructor(ttl = 300_000) { this.ttl = ttl; this.map = new Map(); }
@@ -35,7 +35,7 @@ class SessionRuntime {
     this.qr = null;
     this.status = 'idle';
     this.lastError = null;
-    this.connecting = false;
+    this.connectPromise = null;
     this.stopRequested = false;
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
@@ -60,10 +60,25 @@ class SessionRuntime {
   }
 
   async start() {
-    if (this.connecting || this.status === 'open') return this.snapshot();
+    if (this.status === 'open' && this.sock) return this.snapshot();
+    if (this.connectPromise) {
+      await this.connectPromise;
+      return this.snapshot();
+    }
+
     this.stopRequested = false;
-    this.connecting = true;
+    this.connectPromise = this._start();
+    try {
+      await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
+    return this.snapshot();
+  }
+
+  async _start() {
     this.status = 'connecting';
+    this.lastError = null;
     await upsertSession(this.sessionId, { status: 'connecting', last_error: null });
 
     try {
@@ -100,17 +115,17 @@ class SessionRuntime {
       sock.ev.on('creds.update', async () => {
         try {
           await saveCreds();
+          this.emit('creds.update', { sessionId: this.sessionId });
         } catch (err) {
           logger.error({ err, sessionId: this.sessionId }, 'credential persistence failed');
+          this.lastError = err.message;
         }
       });
 
       this.bindEvents(sock);
-
-      this.connecting = false;
-      return this.snapshot();
     } catch (err) {
-      this.connecting = false;
+      this.sock = null;
+      this.qr = null;
       this.status = 'error';
       this.lastError = err.message;
       await upsertSession(this.sessionId, { status: 'error', last_error: err.message }).catch(() => {});
@@ -121,11 +136,26 @@ class SessionRuntime {
   bindEvents(sock) {
     sock.ev.on('connection.update', async update => {
       const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
+
+      logger.debug(
+        {
+          sessionId: this.sessionId,
+          connection,
+          hasQr: !!qr,
+          isNewLogin,
+          receivedPendingNotifications,
+        },
+        'connection.update',
+      );
+
       if (qr) {
         this.qr = qr;
         this.status = 'qr';
+        this.lastError = null;
+        await upsertSession(this.sessionId, { status: 'qr', last_error: null }).catch(err => {
+          logger.error({ err, sessionId: this.sessionId }, 'failed to persist QR status');
+        });
         this.emit('qr', { sessionId: this.sessionId, qr });
-        await upsertSession(this.sessionId, { status: 'qr' }).catch(() => {});
       }
 
       if (connection === 'open') {
@@ -134,15 +164,27 @@ class SessionRuntime {
         this.lastError = null;
         this.reconnectAttempt = 0;
         const user = sock.user;
+        const jid = user?.id ?? null;
+
         await upsertSession(this.sessionId, {
           status: 'open',
-          jid: user?.id ?? null,
+          jid,
           phone: user?.id?.split(':')[0]?.split('@')[0] ?? null,
           push_name: user?.name ?? null,
           connected_at: new Date().toISOString(),
           last_error: null,
-        }).catch(() => {});
-        this.emit('connection', { sessionId: this.sessionId, connection, isNewLogin, receivedPendingNotifications });
+        }).catch(err => {
+          logger.error({ err, sessionId: this.sessionId }, 'failed to persist open status');
+        });
+
+        this.emit('connection', {
+          sessionId: this.sessionId,
+          status: 'connected',
+          connection,
+          jid,
+          isNewLogin,
+          receivedPendingNotifications,
+        });
       }
 
       if (connection === 'close') {
@@ -154,17 +196,34 @@ class SessionRuntime {
         const replaced = statusCode === DisconnectReason.connectionReplaced;
         this.lastError = lastDisconnect?.error?.message ?? `closed:${statusCode ?? 'unknown'}`;
 
+        logger.warn(
+          { sessionId: this.sessionId, statusCode, loggedOut, badSession, replaced },
+          'WhatsApp connection closed',
+        );
+
         if (loggedOut || badSession || replaced || this.stopRequested) {
           this.status = loggedOut ? 'logged_out' : 'closed';
           await upsertSession(this.sessionId, { status: this.status, last_error: this.lastError }).catch(() => {});
-          this.emit('connection', { sessionId: this.sessionId, connection, statusCode, shouldReconnect: false });
+          this.emit('connection', {
+            sessionId: this.sessionId,
+            connection,
+            status: this.status,
+            statusCode,
+            shouldReconnect: false,
+          });
           return;
         }
 
         this.status = 'reconnecting';
         this.reconnectAttempt++;
         await upsertSession(this.sessionId, { status: 'reconnecting', last_error: this.lastError }).catch(() => {});
-        this.emit('connection', { sessionId: this.sessionId, connection, statusCode, shouldReconnect: true });
+        this.emit('connection', {
+          sessionId: this.sessionId,
+          connection,
+          status: 'reconnecting',
+          statusCode,
+          shouldReconnect: true,
+        });
         this.scheduleReconnect();
       }
     });
@@ -200,7 +259,6 @@ class SessionRuntime {
 
     sock.ev.on('messages.update', async updates => {
       this.emit('messages.update', { sessionId: this.sessionId, updates });
-      // Preserve latest raw message updates where possible.
       for (const u of updates) {
         if (u.key?.id && u.update?.message) {
           await upsertMessages(this.sessionId, [{ key: u.key, message: u.update.message }]).catch(() => {});
@@ -257,16 +315,16 @@ class SessionRuntime {
     sock.ev.on('labels.edit', payload => this.emit('labels.edit', { sessionId: this.sessionId, payload }));
     sock.ev.on('labels.association', payload => this.emit('labels.association', { sessionId: this.sessionId, payload }));
     sock.ev.on('call', payload => this.emit('call', { sessionId: this.sessionId, payload }));
-    sock.ev.on('creds.update', () => this.emit('creds.update', { sessionId: this.sessionId }));
   }
 
   scheduleReconnect() {
-    if (this.reconnectTimer || this.stopRequested) return;
+    if (this.reconnectTimer || this.stopRequested || this.connectPromise) return;
     const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt - 1, 5));
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      try { await this.start(); }
-      catch (err) {
+      try {
+        await this.start();
+      } catch (err) {
         logger.error({ err, sessionId: this.sessionId }, 'reconnect failed');
         this.scheduleReconnect();
       }
@@ -274,7 +332,7 @@ class SessionRuntime {
   }
 
   async send(content, options = {}) {
-    if (!this.sock) throw new Error('WhatsApp is not connected');
+    if (!this.sock || this.status !== 'open') throw new Error('WhatsApp is not connected');
     return this.sock.sendMessage(options.jid, content, options.options);
   }
 
@@ -282,13 +340,44 @@ class SessionRuntime {
     this.stopRequested = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    if (this.sock) {
-      try { await this.sock.logout(); } catch {}
-      this.sock = null;
-    }
-    this.status = 'logged_out';
+
+    const sock = this.sock;
+    this.sock = null;
     this.qr = null;
-    await upsertSession(this.sessionId, { status: 'logged_out' });
+    this.status = 'logged_out';
+
+    if (sock) {
+      try { await sock.logout(); } catch (err) {
+        logger.warn({ err, sessionId: this.sessionId }, 'WhatsApp logout request failed');
+      }
+    }
+
+    const { error: credsError } = await supabase
+      .from('wa_auth_creds')
+      .delete()
+      .eq('session_id', this.sessionId);
+    if (credsError) logger.warn({ err: credsError, sessionId: this.sessionId }, 'failed to clear persisted credentials');
+
+    const { error: keysError } = await supabase
+      .from('wa_signal_keys')
+      .delete()
+      .eq('session_id', this.sessionId);
+    if (keysError) logger.warn({ err: keysError, sessionId: this.sessionId }, 'failed to clear persisted signal keys');
+
+    await upsertSession(this.sessionId, {
+      status: 'logged_out',
+      last_error: null,
+      jid: null,
+      phone: null,
+      push_name: null,
+    });
+
+    this.emit('connection', {
+      sessionId: this.sessionId,
+      connection: 'close',
+      status: 'logged_out',
+      shouldReconnect: false,
+    });
   }
 
   async getQr() {
@@ -302,7 +391,7 @@ export class WhatsAppManager {
     this.sessions = new Map();
   }
 
-  async getOrCreate(sessionId) {
+  getOrCreate(sessionId) {
     let runtime = this.sessions.get(sessionId);
     if (!runtime) {
       runtime = new SessionRuntime(sessionId, this.io);
@@ -312,20 +401,25 @@ export class WhatsAppManager {
   }
 
   async connect(sessionId) {
-    const r = await this.getOrCreate(sessionId);
+    const r = this.getOrCreate(sessionId);
     await r.start();
     return r;
   }
 
   async restorePersistedSessions() {
-    const { data, error } = await (await import('../supabase.js')).supabase
-      .from('wa_sessions').select('id,status');
+    const { data, error } = await supabase
+      .from('wa_sessions')
+      .select('id,status')
+      .neq('status', 'logged_out');
     if (error) throw error;
-    for (const s of data ?? []) {
-      if (s.status !== 'logged_out') {
-        this.connect(s.id).catch(err => logger.error({ err, sessionId: s.id }, 'restore failed'));
+
+    await Promise.all((data ?? []).map(async s => {
+      try {
+        await this.connect(s.id);
+      } catch (err) {
+        logger.error({ err, sessionId: s.id }, 'restore failed');
       }
-    }
+    }));
   }
 
   get(sessionId) { return this.sessions.get(sessionId); }
