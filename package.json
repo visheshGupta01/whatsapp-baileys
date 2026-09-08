@@ -1,0 +1,30 @@
+{
+  "name": "baileys-supabase-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "migrate": "supabase db push"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.57.4",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "pino": "^9.9.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "@cacheable/node-cache": "^1.5.1",
+    "pino-pretty": "^13.1.1"
+  }
+}
