@@ -47,6 +47,7 @@ class SessionRuntime {
     return {
       sessionId: this.sessionId,
       status: this.status,
+      connected: this.status === 'open',
       qrAvailable: !!this.qr,
       lastError: this.lastError,
       reconnectAttempt: this.reconnectAttempt,
@@ -151,6 +152,10 @@ class SessionRuntime {
         'connection.update',
       );
 
+      if (isNewLogin) {
+        logger.info({ sessionId: this.sessionId }, 'WhatsApp pairing completed; waiting for post-pairing reconnect');
+      }
+
       if (qr) {
         this.qr = qr;
         this.status = 'qr';
@@ -197,12 +202,20 @@ class SessionRuntime {
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         const badSession = statusCode === DisconnectReason.badSession;
         const replaced = statusCode === DisconnectReason.connectionReplaced;
+        const restartRequired = statusCode === 515;
         this.lastError = lastDisconnect?.error?.message ?? `closed:${statusCode ?? 'unknown'}`;
 
-        logger.warn(
-          { sessionId: this.sessionId, statusCode, loggedOut, badSession, replaced },
-          'WhatsApp connection closed',
-        );
+        if (restartRequired) {
+          logger.info(
+            { sessionId: this.sessionId, statusCode, isNewLogin },
+            'WhatsApp requested a post-pairing socket restart; reconnecting with persisted credentials',
+          );
+        } else {
+          logger.warn(
+            { sessionId: this.sessionId, statusCode, loggedOut, badSession, replaced },
+            'WhatsApp connection closed',
+          );
+        }
 
         if (loggedOut || badSession || replaced || this.stopRequested) {
           this.status = loggedOut ? 'logged_out' : 'closed';
