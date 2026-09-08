@@ -61,9 +61,6 @@ class SessionRuntime {
   }
 
   async start() {
-    // A live socket is already handling this session. This is especially
-    // important while waiting for QR: connectPromise only covers socket
-    // creation, not the full QR pairing lifecycle.
     if (this.sock && ['connecting', 'qr', 'open'].includes(this.status)) return this.snapshot();
     if (this.connectPromise) {
       await this.connectPromise;
@@ -231,7 +228,7 @@ class SessionRuntime {
         }
 
         this.status = 'reconnecting';
-        this.reconnectAttempt++;
+        this.reconnectAttempt = restartRequired ? 0 : this.reconnectAttempt + 1;
         await upsertSession(this.sessionId, { status: 'reconnecting', last_error: this.lastError }).catch(() => {});
         this.emit('connection', {
           sessionId: this.sessionId,
@@ -240,7 +237,7 @@ class SessionRuntime {
           statusCode,
           shouldReconnect: true,
         });
-        this.scheduleReconnect();
+        this.scheduleReconnect(restartRequired ? 250 : undefined);
       }
     });
 
@@ -333,9 +330,9 @@ class SessionRuntime {
     sock.ev.on('call', payload => this.emit('call', { sessionId: this.sessionId, payload }));
   }
 
-  scheduleReconnect() {
+  scheduleReconnect(delayOverride) {
     if (this.reconnectTimer || this.stopRequested || this.connectPromise) return;
-    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt - 1, 5));
+    const delay = delayOverride ?? Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt - 1, 5));
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       try {
