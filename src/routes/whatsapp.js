@@ -34,8 +34,8 @@ export function createWhatsappRouter(manager) {
   router.post('/connect', async (req, res, next) => {
     try {
       const r = await getRuntime(req);
-      const sessionId = r.sessionId;
-      await manager.connect(sessionId);
+      await manager.connect(r.sessionId);
+      res.set('Cache-Control', 'no-store');
       res.json(r.snapshot());
     } catch (e) { next(e); }
   });
@@ -44,8 +44,32 @@ export function createWhatsappRouter(manager) {
     try {
       const sessionId = req.query.sessionId || req.user.id;
       const r = manager.get(sessionId);
-      const { data } = await supabase.from('wa_sessions').select('*').eq('id', sessionId).maybeSingle();
-      res.json(r?.snapshot() ?? data ?? { sessionId, status: 'idle', qrAvailable: false });
+      res.set('Cache-Control', 'no-store');
+
+      if (r) return res.json(r.snapshot());
+
+      const { data, error } = await supabase
+        .from('wa_sessions')
+        .select('id,status,last_error,jid')
+        .eq('id', sessionId)
+        .maybeSingle();
+      if (error) throw error;
+
+      res.json(data ? {
+        sessionId: data.id,
+        status: data.status ?? 'disconnected',
+        qrAvailable: false,
+        lastError: data.last_error ?? null,
+        reconnectAttempt: 0,
+        connectedJid: data.jid ?? null,
+      } : {
+        sessionId,
+        status: 'disconnected',
+        qrAvailable: false,
+        lastError: null,
+        reconnectAttempt: 0,
+        connectedJid: null,
+      });
     } catch (e) { next(e); }
   });
 
@@ -54,6 +78,7 @@ export function createWhatsappRouter(manager) {
       const sessionId = req.query.sessionId || req.user.id;
       const r = manager.get(sessionId);
       if (!r?.qr) return res.status(404).json({ error: 'QR is not currently available' });
+      res.set('Cache-Control', 'no-store');
       res.json({ sessionId, qr: r.qr, dataUrl: await QRCode.toDataURL(r.qr) });
     } catch (e) { next(e); }
   });
@@ -62,7 +87,7 @@ export function createWhatsappRouter(manager) {
     try {
       const r = await getRuntime(req);
       await r.logout();
-      res.json({ ok: true });
+      res.json({ ok: true, ...r.snapshot() });
     } catch (e) { next(e); }
   });
 
