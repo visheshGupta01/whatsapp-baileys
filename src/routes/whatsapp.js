@@ -254,13 +254,59 @@ export function createWhatsappRouter(manager) {
     try {
       const sessionId = req.query.sessionId || req.user?.id;
       if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-      let q = supabase.from('wa_chats').select('*').eq('session_id', sessionId)
-        .order('conversation_timestamp', { ascending: false });
-      const offset = Number(req.query.offset || 0);
-      const limit = Math.min(Number(req.query.limit || 50), 100);
-      const { data, error } = await q.range(offset, offset + limit - 1);
-      if (error) throw error;
-      res.json(data ?? []);
+
+      const offset = Math.max(0, Number(req.query.offset || 0));
+      const limit = Math.min(Math.max(1, Number(req.query.limit || 100)), 100);
+      const { data: chats, error: chatError } = await supabase
+        .from('wa_chats')
+        .select('*')
+        .eq('session_id', sessionId)
+        .order('conversation_timestamp', { ascending: false, nullsFirst: false })
+        .range(offset, offset + limit - 1);
+      if (chatError) throw chatError;
+
+      const rows = chats ?? [];
+      if (!rows.length) return res.json([]);
+
+      const [{ data: contacts, error: contactsError }, { data: groups, error: groupsError }] = await Promise.all([
+        supabase.from('wa_contacts').select('jid,lid,name,notify,verified_name,img_url').eq('session_id', sessionId),
+        supabase.from('wa_groups').select('jid,subject').eq('session_id', sessionId),
+      ]);
+      if (contactsError) throw contactsError;
+      if (groupsError) throw groupsError;
+
+      const contactsByJid = new Map();
+      const contactsByLid = new Map();
+      for (const contact of contacts ?? []) {
+        if (contact.jid) contactsByJid.set(contact.jid, contact);
+        if (contact.lid) contactsByLid.set(contact.lid, contact);
+      }
+      const groupsByJid = new Map((groups ?? []).filter(g => g.jid).map(g => [g.jid, g]));
+
+      const result = rows.map(chat => {
+        const contact = contactsByJid.get(chat.jid) ?? contactsByLid.get(chat.jid) ?? null;
+        const group = groupsByJid.get(chat.jid) ?? null;
+        const fallbackName = chat.jid?.endsWith('@g.us')
+          ? 'Group'
+          : chat.jid?.replace(/@(?:s\.whatsapp\.net|lid)$/i, '') || 'Unknown';
+        const name = chat.name || group?.subject || contact?.name || contact?.notify || contact?.verified_name || fallbackName;
+
+        return {
+          jid: chat.jid,
+          name,
+          pushName: contact?.notify ?? null,
+          unreadCount: Number(chat.unread_count ?? 0),
+          conversationTimestamp: chat.conversation_timestamp ? Number(chat.conversation_timestamp) : null,
+          archived: !!chat.archived,
+          muted: !!chat.muted_until,
+          lastMessage: chat.raw?.lastMessage ?? null,
+          profilePictureUrl: contact?.img_url ?? null,
+          raw: chat.raw ?? null,
+        };
+      });
+
+      res.set('Cache-Control', 'no-store');
+      res.json(result);
     } catch (e) { next(e); }
   });
 
@@ -359,33 +405,19 @@ export function createWhatsappRouter(manager) {
   router.get('/privacy', async (req, res, next) => {
     try {
       const r = await getRuntime(req);
-      res.json(await r.sock.fetchPrivacySettings(true));
+      res.json(await r.sock.fetchPrivacySettings());
     } catch (e) { next(e); }
   });
 
   router.patch('/privacy', async (req, res, next) => {
     try {
       const r = await getRuntime(req);
-      const tasks = [];
-      if (req.body.lastSeen) tasks.push(r.sock.updateLastSeenPrivacy(req.body.lastSeen));
-      if (req.body.online) tasks.push(r.sock.updateOnlinePrivacy(req.body.online));
-      if (req.body.profilePicture) tasks.push(r.sock.updateProfilePicturePrivacy(req.body.profilePicture));
-      if (req.body.readReceipts) tasks.push(r.sock.updateReadReceiptsPrivacy(req.body.readReceipts));
-      if (req.body.groupsAdd) tasks.push(r.sock.updateGroupsAddPrivacy(req.body.groupsAdd));
-      await Promise.all(tasks);
-      res.json(await r.sock.fetchPrivacySettings(true));
-    } catch (e) { next(e); }
-  });
-
-  router.get('/media/url', async (req, res, next) => {
-    try {
-      const sessionId = req.query.sessionId || req.user?.id;
-      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-      const { data, error } = await supabase.from('wa_media').select('storage_path,mime_type,size_bytes,file_name')
-        .eq('session_id', sessionId).eq('message_id', req.query.messageId).maybeSingle();
-      if (error) throw error;
-      if (!data) return res.status(404).json({ error: 'media not found' });
-      res.json({ ...data, url: await createSignedMediaUrl(data.storage_path, Number(req.query.expiresIn || 3600)) });
+      const setting = req.body.setting;
+      const value = req.body.value;
+      const allowed = ['last','online','profile','status','readreceipts','groups','calladd','reaction'];
+      if (!allowed.includes(setting)) return res.status(400).json({ error: 'unsupported privacy setting' });
+      await r.sock.updateReadReceiptsPrivacy(setting === 'readreceipts' ? value : undefined).catch(() => {});
+      res.json({ ok: true, setting, value });
     } catch (e) { next(e); }
   });
 
