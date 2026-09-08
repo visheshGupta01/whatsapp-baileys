@@ -15,9 +15,19 @@ export function createWhatsappRouter(manager) {
   const router = express.Router();
 
   const getRuntime = async (req) => {
-    const requested = req.params.sessionId || req.body.sessionId || req.query.sessionId;
-    const sessionId = requested || req.user.id;
+    const requested = req.params?.sessionId || req.body?.sessionId || req.query?.sessionId;
+    const sessionId = requested || req.user?.id;
+    if (!sessionId) {
+      const e = new Error('sessionId is required');
+      e.statusCode = 400;
+      throw e;
+    }
     if (env.REQUIRE_SUPABASE_AUTH) {
+      if (!req.user?.id) {
+        const e = new Error('authenticated user is required');
+        e.statusCode = 401;
+        throw e;
+      }
       const { data, error } = await supabase.from('wa_sessions').select('owner_id').eq('id', sessionId).maybeSingle();
       if (error) throw error;
       if (data && data.owner_id && data.owner_id !== req.user.id) {
@@ -42,7 +52,8 @@ export function createWhatsappRouter(manager) {
 
   router.get('/status', async (req, res, next) => {
     try {
-      const sessionId = req.query.sessionId || req.user.id;
+      const sessionId = req.query.sessionId || req.user?.id;
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
       const r = manager.get(sessionId);
       res.set('Cache-Control', 'no-store');
 
@@ -58,6 +69,7 @@ export function createWhatsappRouter(manager) {
       res.json(data ? {
         sessionId: data.id,
         status: data.status ?? 'disconnected',
+        connected: data.status === 'open',
         qrAvailable: false,
         lastError: data.last_error ?? null,
         reconnectAttempt: 0,
@@ -65,6 +77,7 @@ export function createWhatsappRouter(manager) {
       } : {
         sessionId,
         status: 'disconnected',
+        connected: false,
         qrAvailable: false,
         lastError: null,
         reconnectAttempt: 0,
@@ -75,7 +88,8 @@ export function createWhatsappRouter(manager) {
 
   router.get('/qr', async (req, res, next) => {
     try {
-      const sessionId = req.query.sessionId || req.user.id;
+      const sessionId = req.query.sessionId || req.user?.id;
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
       const r = manager.get(sessionId);
       if (!r?.qr) return res.status(404).json({ error: 'QR is not currently available' });
       res.set('Cache-Control', 'no-store');
@@ -238,14 +252,15 @@ export function createWhatsappRouter(manager) {
 
   router.get('/chats', async (req, res, next) => {
     try {
-      const sessionId = req.query.sessionId || req.user.id;
+      const sessionId = req.query.sessionId || req.user?.id;
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
       let q = supabase.from('wa_chats').select('*').eq('session_id', sessionId)
         .order('conversation_timestamp', { ascending: false });
       const offset = Number(req.query.offset || 0);
       const limit = Math.min(Number(req.query.limit || 50), 100);
       const { data, error } = await q.range(offset, offset + limit - 1);
       if (error) throw error;
-      res.json(data);
+      res.json(data ?? []);
     } catch (e) { next(e); }
   });
 
@@ -364,7 +379,8 @@ export function createWhatsappRouter(manager) {
 
   router.get('/media/url', async (req, res, next) => {
     try {
-      const sessionId = req.query.sessionId || req.user.id;
+      const sessionId = req.query.sessionId || req.user?.id;
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
       const { data, error } = await supabase.from('wa_media').select('storage_path,mime_type,size_bytes,file_name')
         .eq('session_id', sessionId).eq('message_id', req.query.messageId).maybeSingle();
       if (error) throw error;
